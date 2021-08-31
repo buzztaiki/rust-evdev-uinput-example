@@ -3,12 +3,20 @@ use evdev::{AttributeSet, Device, InputEvent, InputEventKind, Key};
 use nix::{ioctl_write_int, libc};
 use std::collections::HashMap;
 use std::os::unix::prelude::AsRawFd;
-use std::thread::sleep;
-use std::time::Duration;
-use std::{env, process};
+use std::{env, io, process};
 
 // see /usr/include/linux/input.h
 ioctl_write_int!(eviocgrab, b'E', 0x90);
+
+fn await_release_all_keys(d: &Device) -> io::Result<()> {
+    while d.get_key_state()?.iter().count() > 0 {}
+    Ok(())
+}
+
+fn grab(d: &mut Device) -> io::Result<()> {
+    unsafe { eviocgrab(d.as_raw_fd(), 1) }?;
+    Ok(())
+}
 
 fn keymap() -> HashMap<Key, Key> {
     vec![
@@ -22,6 +30,17 @@ fn keymap() -> HashMap<Key, Key> {
     .collect()
 }
 
+fn mapkey(ev: InputEvent, keymap: &HashMap<Key, Key>) -> InputEvent {
+    if let InputEventKind::Key(key) = ev.kind() {
+        match keymap.get(&key) {
+            Some(ev1) => InputEvent::new(ev.event_type(), ev1.code(), ev.value()),
+            None => ev,
+        }
+    } else {
+        ev
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = env::args().collect::<Vec<_>>();
     if args.len() != 2 {
@@ -30,39 +49,25 @@ fn main() -> anyhow::Result<()> {
     }
 
     let fname = &args[1];
-    let mut input_device = Device::open(fname)?;
-    while input_device.get_key_state()?.iter().count() > 0 {
-        sleep(Duration::from_millis(100));
-    }
-
-    unsafe {
-        eviocgrab(input_device.as_raw_fd(), 1)?;
-    }
+    let mut src_device = Device::open(fname)?;
+    await_release_all_keys(&src_device)?;
+    grab(&mut src_device)?;
 
     let mut keys = AttributeSet::<Key>::new();
     for code in (0..libc::KEY_CNT).map(|x| x as u16) {
         keys.insert(Key::new(code));
     }
 
-    let mut device = VirtualDeviceBuilder::new()?
+    let mut dst_device = VirtualDeviceBuilder::new()?
         .name("key-mapper-example")
         .with_keys(&keys)?
-        // TODO
-        // .with_relative_axes(axes)?
         .build()?;
 
     let keymap = keymap();
     eprintln!("Waiting for Ctrl-C...");
     loop {
-        for ev in input_device.fetch_events()? {
-            // TODO key 以外のイベント
-            if let InputEventKind::Key(key) = ev.kind() {
-                let ev1 = match keymap.get(&key) {
-                    Some(ev1) => InputEvent::new(ev.event_type(), ev1.code(), ev.value()),
-                    None => ev,
-                };
-                device.emit(&[ev1])?;
-            }
+        for ev in src_device.fetch_events()? {
+            dst_device.emit(&[mapkey(ev, &keymap)])?;
         }
     }
 }

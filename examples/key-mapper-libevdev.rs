@@ -1,5 +1,5 @@
-use evdev_rs::enums::{EventCode, EV_KEY};
-use evdev_rs::{uinput, Device, GrabMode, InputEvent, ReadFlag};
+use evdev_rs::enums::{EventCode, EventType, EV_KEY};
+use evdev_rs::{uinput, Device, DeviceWrapper, GrabMode, InputEvent, ReadFlag, UninitDevice};
 use nix::{ioctl_read_buf, libc};
 use std::collections::HashMap;
 use std::fs::File;
@@ -52,14 +52,22 @@ fn main() -> anyhow::Result<()> {
 
     let fname = &args[1];
     let file = File::open(fname)?;
-
     await_release_all_keys(&file)?;
 
-    let mut device = Device::new_from_file(file)?;
-    device.grab(GrabMode::Grab)?;
+    let mut src_device = Device::new_from_file(file)?;
+    src_device.grab(GrabMode::Grab)?;
 
     // https://www.freedesktop.org/software/libevdev/doc/1.4/group__uinput.html
-    let ui_device = uinput::UInputDevice::create_from_device(&device)?;
+    let base_device = UninitDevice::new().ok_or_else(|| anyhow::anyhow!("create base device"))?;
+    base_device.set_name("key-mapper-example");
+    base_device.enable_event_type(&EventType::EV_KEY)?;
+    for code in (0..libc::KEY_CNT).map(|x| x as u32) {
+        if let Some(key) = evdev_rs::enums::int_to_ev_key(code) {
+            base_device.enable_event_code(&EventCode::EV_KEY(key), None)?;
+        }
+    }
+
+    let dst_device = uinput::UInputDevice::create_from_device(&base_device)?;
 
     let keymap = keymap();
     eprintln!("Waiting for Ctrl-C...");
@@ -67,18 +75,18 @@ fn main() -> anyhow::Result<()> {
     // https://gitlab.freedesktop.org/libevdev/libevdev/-/blob/master/tools/libevdev-events.c#L156
     // https://docs.rs/evdev-rs/latest/evdev_rs/struct.Device.html#method.next_event
     loop {
-        let (st, ev) = device.next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING)?;
+        let (st, ev) = src_device.next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING)?;
         match st {
-            evdev_rs::ReadStatus::Success => ui_device.write_event(&mapkey(ev, &keymap))?,
+            evdev_rs::ReadStatus::Success => dst_device.write_event(&mapkey(ev, &keymap))?,
             evdev_rs::ReadStatus::Sync => {
                 eprintln!("dropped");
                 'sync: loop {
-                    match device.next_event(ReadFlag::SYNC) {
-                        Ok((_, ev)) => ui_device.write_event(&mapkey(ev, &keymap))?,
+                    match src_device.next_event(ReadFlag::SYNC) {
+                        Ok((_, ev)) => dst_device.write_event(&mapkey(ev, &keymap))?,
                         Err(_) => {
                             eprintln!("re-synced");
                             break 'sync;
-                        },
+                        }
                     }
                 }
             }
